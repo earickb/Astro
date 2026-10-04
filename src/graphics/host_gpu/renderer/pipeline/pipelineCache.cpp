@@ -133,7 +133,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	static std::atomic_int id = 0;
-	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_ {:016x}.spv",
+	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_{:016x}.spv",
 	                                                             id++, stage_name, shader_hash);
 	Common::File::CreateDirectories(path.parent_path());
 	Common::File file(path);
