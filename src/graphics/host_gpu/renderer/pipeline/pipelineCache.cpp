@@ -98,13 +98,42 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
 }
 
+// Reports why the first resource materialization of a shader failed. MaterializeResources()
+// returns a bare false from many places, so the generic EXIT_IF text gives no hint about which
+// one fired. The plan flags below separate the two main cases: the shader's resources were never
+// fully tracked at translation time (a recompiler gap, no retry can help), versus a guest-memory
+// read needed for specialization failing at runtime (for example the memory is GPU-modified or
+// unmapped when the shader is first compiled).
+void ExitMaterializeFailure(const ShaderRecompiler::IR::ResourcePlan& plan, ShaderType stage,
+                            uint64_t hash, uint32_t user_data_count, uint64_t shader_base) {
+	const char* cause = "a descriptor, SRT value or buffer/image/sampler decode failed";
+	if (!plan.resource_tracking_complete) {
+		cause = "shader resources were not fully tracked at translation time";
+	} else if (!plan.srt_plan_complete) {
+		cause = "the SRT read plan is incomplete";
+	} else if (plan.requires_specialization_memory) {
+		cause = "a clean guest-memory read needed for specialization failed (memory may be "
+		        "GPU-modified, unmapped, or read off the GPU thread)";
+	}
+	EXIT("shader resource materialization failed: stage=%d hash=0x%016" PRIx64
+	     " user_data_count=%u shader_base=0x%016" PRIx64
+	     " resource_tracking_complete=%d srt_plan_complete=%d requires_specialization_memory=%d"
+	     " srt_reads=%zu descriptor_sources=%zu buffers=%zu images=%zu samplers=%zu\n"
+	     "likely cause: %s\n",
+	     static_cast<int>(stage), hash, user_data_count, shader_base,
+	     plan.resource_tracking_complete ? 1 : 0, plan.srt_plan_complete ? 1 : 0,
+	     plan.requires_specialization_memory ? 1 : 0, plan.srt_reads.size(),
+	     plan.descriptor_sources.size(), plan.info.buffers.size(), plan.info.images.size(),
+	     plan.info.samplers.size(), cause);
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
 	static std::atomic_int id = 0;
-	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_{:016x}.spv",
+	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_ {:016x}.spv",
 	                                                             id++, stage_name, shader_hash);
 	Common::File::CreateDirectories(path.parent_path());
 	Common::File file(path);
@@ -293,9 +322,12 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				ExitMaterializeFailure(entry->second.resource_plan, stage, params.hash,
+				                       params.user_data_count, params.Base());
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -357,9 +389,12 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				ExitMaterializeFailure(entry->second.resource_plan, stage, params.hash,
+				                       params.user_data_count, params.Base());
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
